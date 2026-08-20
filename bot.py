@@ -33,9 +33,8 @@ ADMIN_IDS = ["8975949736"]  # Permanent Admin User ID
 KWIKUPI_API_KEY = "pk_live_f4ItCmj2Os4L6SoOfCWEmq44"
 KWIKUPI_SECRET = "Sk_live_ple3JKmPOzNz2G3dvY1qz9pMO07hgGOb9SKrgKc8toZLUBzA"
 
-# OpenRouter Configuration
+# OpenRouter Configuration (Reads securely from Environment Variables)
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
-os.environ["OPENROUTER_API_KEY"] = OPENROUTER_KEY
 
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
@@ -144,16 +143,18 @@ def run_flask():
 async def start_child_bot_instance(bot_token: str, prompt_text: str, owner_id: str, bot_key: str):
     """Runs a child bot instance asynchronously within the main event loop."""
     try:
-        child_app = Application.builder().token(bot_token).build()
+        # Re-initialize OpenAI client for OpenRouter inside the background task
+        child_client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=os.environ.get("OPENROUTER_API_KEY", "").strip(),
+        )
 
-        async def child_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-            await update.message.reply_text(f"🤖 Hello! I am your custom bot created via Sandeep's Bot Builder.\n\nInstructions: {prompt_text}")
+        child_app = Application.builder().token(bot_token).build()
 
         async def child_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_text = update.message.text
-            # Use AI or standard reply based on prompt configuration
             try:
-                response = client.chat.completions.create(
+                response = child_client.chat.completions.create(
                     model="deepseek/deepseek-chat",
                     messages=[
                         {"role": "system", "content": f"You are a helpful telegram bot operating under these instructions: {prompt_text}. The owner/admin is user ID {owner_id}."},
@@ -165,16 +166,15 @@ async def start_child_bot_instance(bot_token: str, prompt_text: str, owner_id: s
                 await update.message.reply_text(reply)
             except Exception as e:
                 logger.error(f"Child bot AI error: {e}")
-                await update.message.reply_text("⚠️ Sorry, I encountered an error processing your request.")
+                await update.message.reply_text("⚠️ Sorry, I encountered an error connecting to the AI provider.")
 
-        child_app.add_handler(CommandHandler("start", child_start))
+        child_app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text(f"🤖 Bot is active!\n\nInstructions: {prompt_text}")))
         child_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, child_message))
 
         await child_app.initialize()
         await child_app.start()
         await child_app.updater.start_polling()
         
-        # Keep task alive
         while True:
             await asyncio.sleep(3600)
     except Exception as e:
