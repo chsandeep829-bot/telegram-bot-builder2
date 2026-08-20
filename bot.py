@@ -33,12 +33,12 @@ ADMIN_IDS = ["8975949736"]  # Permanent Admin User ID
 KWIKUPI_API_KEY = "pk_live_f4ItCmj2Os4L6SoOfCWEmq44"
 KWIKUPI_SECRET = "Sk_live_ple3JKmPOzNz2G3dvY1qz9pMO07hgGOb9SKrgKc8toZLUBzA"
 
-# OpenRouter API Key embedded directly
-OPENROUTER_KEY = "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"
+# Groq API Key embedded directly
+GROQ_API_KEY = "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"
 
 client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_KEY,
+    base_url="https://api.groq.com/openai/v1",
+    api_key=GROQ_API_KEY,
 )
 
 DB_FILE = "user_bots.json"
@@ -214,8 +214,8 @@ def run_child_bot_process(bot_token: str, prompt_text: str, owner_id: str):
 
     try:
         child_client = OpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=OPENROUTER_KEY,
+            base_url="https://api.groq.com/openai/v1",
+            api_key=GROQ_API_KEY,
         )
 
         child_app = Application.builder().token(bot_token).build()
@@ -224,7 +224,7 @@ def run_child_bot_process(bot_token: str, prompt_text: str, owner_id: str):
             user_text = update.message.text
             try:
                 response = child_client.chat.completions.create(
-                    model="deepseek/deepseek-chat",
+                    model="llama-3.3-70b-versatile",
                     messages=[
                         {"role": "system", "content": f"You are a helpful telegram bot operating under these instructions: {prompt_text}. The owner/admin is user ID {owner_id}."},
                         {"role": "user", "content": user_text}
@@ -235,7 +235,7 @@ def run_child_bot_process(bot_token: str, prompt_text: str, owner_id: str):
                 await update.message.reply_text(reply)
             except Exception as e:
                 logger.error(f"Child bot AI error: {e}")
-                await update.message.reply_text("⚠️ Sorry, I encountered an error connecting to the AI provider.")
+                await update.message.reply_text("⚠️ Sorry, I encountered an error connecting to Groq AI.")
 
         child_app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text(f"🤖 Bot is active!\n\nInstructions: {prompt_text}")))
         child_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, child_message))
@@ -756,9 +756,8 @@ def main() -> None:
     application.add_handler(conv_handler)
     application.add_handler(CallbackQueryHandler(handle_callbacks))
 
-    print("Master bot is running...")
+    print("Master bot is running with Groq acceleration...")
     application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
-
