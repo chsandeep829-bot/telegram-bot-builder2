@@ -141,7 +141,7 @@ def run_flask():
 
 # --- DYNAMIC CHILD BOT RUNNER (Thread-Safe Isolation) ---
 def run_child_bot_process(bot_token: str, prompt_text: str, owner_id: str):
-    """Runs a child bot instance inside its own dedicated thread and event loop."""
+    """Runs a child bot instance inside its own dedicated thread and event loop safely."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -173,17 +173,17 @@ def run_child_bot_process(bot_token: str, prompt_text: str, owner_id: str):
         child_app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text(f"🤖 Bot is active!\n\nInstructions: {prompt_text}")))
         child_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, child_message))
 
-        # Run polling blocks this thread safely
-        child_app.run_polling(allowed_updates=Update.ALL_TYPES)
+        # stop_signals=None prevents thread crash on set_wakeup_fd, drop_pending_updates avoids conflict errors
+        child_app.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+            stop_signals=None
+        )
     except Exception as e:
         logger.error(f"Child bot thread crashed: {e}")
 
 def spawn_child_bot(bot_token, prompt_text, owner_id, bot_key):
     """Spawns or restarts a child bot on an independent background thread."""
-    if bot_key in active_child_threads:
-        # Note: python threads can't be cleanly killed mid-execution, but we can overwrite/re-instantiate or track references
-        pass
-
     t = threading.Thread(target=run_child_bot_process, args=(bot_token, prompt_text, owner_id), daemon=True)
     t.start()
     active_child_threads[bot_key] = t
@@ -440,7 +440,6 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if user_id in db and bot_name in db[user_id]:
             bot_key = f"{user_id}_{bot_name}"
             if bot_key in active_child_threads:
-                # Thread reference tracking cleanup
                 del active_child_threads[bot_key]
 
             del db[user_id][bot_name]
@@ -679,7 +678,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(handle_callbacks))
 
     print("Master bot is running...")
-    application.run_polling()
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
