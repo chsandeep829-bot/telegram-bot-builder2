@@ -33,8 +33,8 @@ ADMIN_IDS = ["8975949736"]  # Permanent Admin User ID
 KWIKUPI_API_KEY = "pk_live_f4ItCmj2Os4L6SoOfCWEmq44"
 KWIKUPI_SECRET = "Sk_live_ple3JKmPOzNz2G3dvY1qz9pMO07hgGOb9SKrgKc8toZLUBzA"
 
-# OpenRouter Configuration (Reads securely from Environment Variables)
-OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
+# OpenRouter API Key embedded directly
+OPENROUTER_KEY = "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"
 
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
@@ -215,7 +215,7 @@ def run_child_bot_process(bot_token: str, prompt_text: str, owner_id: str):
     try:
         child_client = OpenAI(
             base_url="https://openrouter.ai/api/v1",
-            api_key=os.environ.get("OPENROUTER_API_KEY", "").strip(),
+            api_key=OPENROUTER_KEY,
         )
 
         child_app = Application.builder().token(bot_token).build()
@@ -224,7 +224,7 @@ def run_child_bot_process(bot_token: str, prompt_text: str, owner_id: str):
             user_text = update.message.text
             try:
                 response = child_client.chat.completions.create(
-                    model="deepseek/deepseek-chat-v3.1",
+                    model="deepseek/deepseek-chat",
                     messages=[
                         {"role": "system", "content": f"You are a helpful telegram bot operating under these instructions: {prompt_text}. The owner/admin is user ID {owner_id}."},
                         {"role": "user", "content": user_text}
@@ -761,3 +761,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
