@@ -7,7 +7,7 @@ import qrcode
 import threading
 import asyncio
 from datetime import datetime, timedelta
-from flask import Flask
+from flask import Flask, request, jsonify
 from openai import OpenAI
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
@@ -49,6 +49,9 @@ GET_NAME, GET_TOKEN, GET_PROMPT, EDIT_PROMPT, WAITING_PAYMENT_PROOF = range(5)
 
 # Dictionary to hold running child bot background threads
 active_child_threads = {}
+
+# Global application reference for sending webhook alerts from Flask thread
+master_application = None
 
 # --- DATABASE HELPERS ---
 def load_db():
@@ -128,12 +131,76 @@ def get_main_keyboard(user_id: str):
         keyboard.append(["🛠️ Admin Control Panel"])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-# --- FLASK SERVER (Required for Render Web Services) ---
+# --- FLASK SERVER & WEBHOOK ENDPOINT ---
 app = Flask(__name__)
 
 @app.route('/')
 def index():
     return "Master Bot & Child Bots are running smoothly on Render!", 200
+
+@app.route('/webhook/kwikupi', methods=['POST'])
+def kwikupi_webhook():
+    """Receives automated payment notifications from KwikUPI gateway."""
+    try:
+        data = request.get_json(silent=True) or request.form.to_dict()
+        logger.info(f"Received KwikUPI Webhook: {data}")
+
+        order_id = data.get("order_id")
+        status = data.get("status")
+
+        if not order_id:
+            return jsonify({"error": "Missing order_id"}), 400
+
+        if status in ["TXN_SUCCESS", "SUCCESS", "PAID"]:
+            pending_db = load_pending_db()
+            target_user_id = None
+            plan_key = None
+            
+            if order_id in pending_db:
+                info = pending_db[order_id]
+                target_user_id = info["user_id"]
+                plan_key = info["plan_key"]
+                del pending_db[order_id]
+                save_pending_db(pending_db)
+            else:
+                parts = order_id.split("_")
+                if len(parts) >= 2:
+                    target_user_id = parts[1]
+                    plan_key = "plan_28d"
+
+            if target_user_id and plan_key in PREMIUM_PLANS:
+                plan_info = PREMIUM_PLANS[plan_key]
+                prem_db = load_premium_db()
+
+                if plan_info["days"] > 10000:
+                    expiry = "lifetime"
+                else:
+                    current_expiry = datetime.now()
+                    if target_user_id in prem_db and prem_db[target_user_id].get("expiry") not in [None, "lifetime"]:
+                        try:
+                            current_expiry = max(datetime.now(), datetime.fromisoformat(prem_db[target_user_id]["expiry"]))
+                        except:
+                            pass
+                    expiry = (current_expiry + timedelta(days=plan_info["days"])).isoformat()
+
+                prem_db[target_user_id] = {"expiry": expiry, "plan": plan_info["name"]}
+                save_premium_db(prem_db)
+
+                if master_application:
+                    asyncio.run_coroutine_threadsafe(
+                        master_application.bot.send_message(
+                            chat_id=int(target_user_id),
+                            text=f"🎉 **Payment Verified Successfully!**\n\n"
+                                 f"Your **{plan_info['name']}** Maker Premium plan is now active automatically via Webhook!",
+                            reply_markup=get_main_keyboard(target_user_id)
+                        ),
+                        master_application.loop
+                    )
+
+        return jsonify({"status": "received"}), 200
+    except Exception as e:
+        logger.error(f"Webhook processing error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 def run_flask():
     port = int(os.environ.get("PORT", 5000))
@@ -157,7 +224,7 @@ def run_child_bot_process(bot_token: str, prompt_text: str, owner_id: str):
             user_text = update.message.text
             try:
                 response = child_client.chat.completions.create(
-                    model="deepseek/deepseek-chat",
+                    model="deepseek/deepseek-chat-v3.1",
                     messages=[
                         {"role": "system", "content": f"You are a helpful telegram bot operating under these instructions: {prompt_text}. The owner/admin is user ID {owner_id}."},
                         {"role": "user", "content": user_text}
@@ -173,7 +240,6 @@ def run_child_bot_process(bot_token: str, prompt_text: str, owner_id: str):
         child_app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text(f"🤖 Bot is active!\n\nInstructions: {prompt_text}")))
         child_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, child_message))
 
-        # stop_signals=None prevents thread crash on set_wakeup_fd, drop_pending_updates avoids conflict errors
         child_app.run_polling(
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True,
@@ -491,6 +557,16 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 "price": plan["price"]
             }
 
+            pending_db = load_pending_db()
+            pending_db[order_id] = {
+                "user_id": user_id,
+                "plan_key": plan_key,
+                "plan_name": plan["name"],
+                "price": plan["price"],
+                "proof": "Automatic Webhook Pending"
+            }
+            save_pending_db(pending_db)
+
             await query.message.delete()
             await context.bot.send_photo(
                 chat_id=int(user_id),
@@ -499,11 +575,11 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                         f"• Plan: {plan['name']}\n"
                         f"• Amount: **₹{plan['price']}**\n"
                         f"• Order ID: `{order_id}`\n\n"
-                        f"1. Scan the QR code.\n"
-                        f"2. Pay.\n"
-                        f"3. Submit transaction ID/proof below:",
+                        f"1. Scan the QR code with any UPI app.\n"
+                        f"2. Complete the payment.\n"
+                        f"3. Your premium status will activate **automatically** via webhook!",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📤 Submit Payment Proof / ID", callback_data="submit_proof")]
+                    [InlineKeyboardButton("📤 Submit Manual Proof (Alternative)", callback_data="submit_proof")]
                 ])
             )
         return ConversationHandler.END
@@ -647,6 +723,8 @@ def restore_all_bots():
     logger.info(f"Successfully restored {count} child bots.")
 
 def main() -> None:
+    global master_application
+
     # Start Flask Web Server for Render
     threading.Thread(target=run_flask, daemon=True).start()
     logger.info("Background Flask web server started for Render...")
@@ -655,6 +733,7 @@ def main() -> None:
     restore_all_bots()
 
     application = Application.builder().token(MASTER_TOKEN).build()
+    master_application = application
 
     conv_handler = ConversationHandler(
         entry_points=[
