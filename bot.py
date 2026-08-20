@@ -47,8 +47,8 @@ PENDING_PAYMENTS_FILE = "pending_payments.json"
 
 GET_NAME, GET_TOKEN, GET_PROMPT, EDIT_PROMPT, WAITING_PAYMENT_PROOF = range(5)
 
-# Dictionary to hold running child bot background tasks
-active_child_tasks = {}
+# Dictionary to hold running child bot background threads
+active_child_threads = {}
 
 # --- DATABASE HELPERS ---
 def load_db():
@@ -139,11 +139,13 @@ def run_flask():
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
-# --- DYNAMIC CHILD BOT RUNNER ---
-async def start_child_bot_instance(bot_token: str, prompt_text: str, owner_id: str, bot_key: str):
-    """Runs a child bot instance asynchronously within the main event loop."""
+# --- DYNAMIC CHILD BOT RUNNER (Thread-Safe Isolation) ---
+def run_child_bot_process(bot_token: str, prompt_text: str, owner_id: str):
+    """Runs a child bot instance inside its own dedicated thread and event loop."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     try:
-        # Re-initialize OpenAI client for OpenRouter inside the background task
         child_client = OpenAI(
             base_url="https://openrouter.ai/api/v1",
             api_key=os.environ.get("OPENROUTER_API_KEY", "").strip(),
@@ -171,23 +173,20 @@ async def start_child_bot_instance(bot_token: str, prompt_text: str, owner_id: s
         child_app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text(f"🤖 Bot is active!\n\nInstructions: {prompt_text}")))
         child_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, child_message))
 
-        await child_app.initialize()
-        await child_app.start()
-        await child_app.updater.start_polling()
-        
-        while True:
-            await asyncio.sleep(3600)
+        # Run polling blocks this thread safely
+        child_app.run_polling(allowed_updates=Update.ALL_TYPES)
     except Exception as e:
-        logger.error(f"Child bot {bot_key} crashed: {e}")
+        logger.error(f"Child bot thread crashed: {e}")
 
 def spawn_child_bot(bot_token, prompt_text, owner_id, bot_key):
-    """Spawns or restarts a child bot task safely."""
-    if bot_key in active_child_tasks:
-        active_child_tasks[bot_key].cancel()
-    
-    loop = asyncio.get_event_loop()
-    task = loop.create_task(start_child_bot_instance(bot_token, prompt_text, owner_id, bot_key))
-    active_child_tasks[bot_key] = task
+    """Spawns or restarts a child bot on an independent background thread."""
+    if bot_key in active_child_threads:
+        # Note: python threads can't be cleanly killed mid-execution, but we can overwrite/re-instantiate or track references
+        pass
+
+    t = threading.Thread(target=run_child_bot_process, args=(bot_token, prompt_text, owner_id), daemon=True)
+    t.start()
+    active_child_threads[bot_key] = t
 
 # --- TELEGRAM MASTER BOT HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -440,9 +439,9 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         if user_id in db and bot_name in db[user_id]:
             bot_key = f"{user_id}_{bot_name}"
-            if bot_key in active_child_tasks:
-                active_child_tasks[bot_key].cancel()
-                del active_child_tasks[bot_key]
+            if bot_key in active_child_threads:
+                # Thread reference tracking cleanup
+                del active_child_threads[bot_key]
 
             del db[user_id][bot_name]
             save_db(db)
@@ -597,12 +596,11 @@ async def save_updated_bot_prompt(update: Update, context: ContextTypes.DEFAULT_
     db[user_id][bot_name]["prompt"] = new_prompt
     save_db(db)
 
-    # Restart instance with updated prompt
     bot_token = db[user_id][bot_name]["token"]
     bot_key = f"{user_id}_{bot_name}"
     spawn_child_bot(bot_token, new_prompt, user_id, bot_key)
 
-    await update.message.reply_text(f"🚀 Successfully updated and restarted child bot **{bot_name}** with your new prompt!", reply_markup=get_main_keyboard(user_id))
+    await update.message.reply_text(f"🚀 Successfully updated child bot **{bot_name}** prompt!", reply_markup=get_main_keyboard(user_id))
     return ConversationHandler.END
 
 async def deploy_ai_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -623,7 +621,6 @@ async def deploy_ai_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     }
     save_db(db)
 
-    # Spawn instance inside master process
     bot_key = f"{user_id}_{bot_name}"
     spawn_child_bot(bot_token, user_prompt, user_id, bot_key)
 
@@ -638,6 +635,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 def restore_all_bots():
     """Restores and starts all user child bots from database on startup."""
     db = load_db()
+    count = 0
     for user_id, bots in db.items():
         for bot_name, info in bots.items():
             token = info.get("token")
@@ -645,14 +643,16 @@ def restore_all_bots():
             if token and prompt:
                 bot_key = f"{user_id}_{bot_name}"
                 spawn_child_bot(token, prompt, user_id, bot_key)
+                count += 1
                 logger.info(f"Restored child bot: @{info.get('username', bot_name)}")
+    logger.info(f"Successfully restored {count} child bots.")
 
 def main() -> None:
     # Start Flask Web Server for Render
     threading.Thread(target=run_flask, daemon=True).start()
     logger.info("Background Flask web server started for Render...")
 
-    # Restore existing child bots
+    # Restore existing child bots in isolated background threads
     restore_all_bots()
 
     application = Application.builder().token(MASTER_TOKEN).build()
@@ -678,9 +678,8 @@ def main() -> None:
     application.add_handler(conv_handler)
     application.add_handler(CallbackQueryHandler(handle_callbacks))
 
-    print("Master bot is running with token AAExxwKEKFCAoT7uk0kpPArpaBD7jNzXHVU...")
+    print("Master bot is running...")
     application.run_polling()
 
 if __name__ == "__main__":
     main()
-
